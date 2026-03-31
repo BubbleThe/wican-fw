@@ -86,6 +86,18 @@ Reads the current hardware RTC clock. Values are BCD-encoded.
 - Write: `{"cmd":"get_rtc_time"}`
 - Response: `{"hour":32,"min":48,"sec":0,"year":38,"month":3,"day":49,"weekday":1}`
 
+**ELM327 passthrough**
+
+Sends a raw ELM327/AT command and returns the response. AutoPID polling is paused automatically while the command executes and resumes after 10 seconds of inactivity. The command string must include the trailing `\r`.
+
+- Write: `{"cmd":"elm327","data":"09 02\r"}`
+- Response:
+```json
+{"response":"49 02 01 31 48 47 ...\r\r>"}
+```
+
+Timeout is 5 seconds. If the ELM327 does not respond: `{"error":"no response"}`.
+
 If no data is available, or the `cmd` value is not recognized, the response is `{"error":"no data"}`.
 
 Non-JSON writes (AT commands, slcan frames) are passed through to the CAN stack as before. Malformed JSON (missing `cmd` field, invalid syntax) is also passed through. The JSON command interface does not interfere with other protocol modes.

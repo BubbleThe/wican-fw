@@ -46,6 +46,7 @@
 #include "esp_gatt_common_api.h"
 #include "cJSON.h"
 #include "rtcm.h"
+#include "elm327.h"
 #include "types.h"
 #include "ble.h"
 #include "comm_server.h"
@@ -1342,6 +1343,26 @@ static void ble_send_response_fff1(const char *data, size_t len)
     }
 }
 
+// ELM327 response accumulator for BLE passthrough
+#define BLE_ELM327_BUF_SIZE 2048
+static char *ble_elm327_buf;
+static size_t ble_elm327_len;
+
+static void ble_elm327_response_cb(char *str, uint32_t len, QueueHandle_t *q, char *cmd_str)
+{
+    (void)q;
+    (void)cmd_str;
+    if (!ble_elm327_buf) return;
+    size_t to_copy = len;
+    if (ble_elm327_len + to_copy > BLE_ELM327_BUF_SIZE - 1)
+        to_copy = BLE_ELM327_BUF_SIZE - 1 - ble_elm327_len;
+    if (to_copy > 0) {
+        memcpy(ble_elm327_buf + ble_elm327_len, str, to_copy);
+        ble_elm327_len += to_copy;
+        ble_elm327_buf[ble_elm327_len] = '\0';
+    }
+}
+
 // Handle JSON commands received on FFF1. Returns true if handled.
 static bool ble_handle_json_cmd(const uint8_t *data, uint16_t len)
 {
@@ -1417,6 +1438,50 @@ static bool ble_handle_json_cmd(const uint8_t *data, uint16_t len)
             response = rtc_buf;
         } else {
             response = "{\"error\":\"rtc read failed\"}";
+        }
+    } else if (strcmp(cmd_str, "elm327") == 0) {
+        cJSON *data_field = cJSON_GetObjectItem(root, "data");
+        if (data_field && cJSON_IsString(data_field) && strlen(data_field->valuestring) > 0) {
+            // Pause autopid polling
+            dev_status_clear_bits(DEV_AUTOPID_ELM327_APP_BIT);
+            autopid_app_reset_timer();
+
+            // Allocate response buffer
+            ble_elm327_buf = heap_caps_malloc(BLE_ELM327_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            ble_elm327_len = 0;
+
+            if (ble_elm327_buf) {
+                ble_elm327_buf[0] = '\0';
+                // Block until ELM327 responds or 5s timeout
+                elm327_run_command(data_field->valuestring, strlen(data_field->valuestring),
+                                   5000, NULL, ble_elm327_response_cb, false, 0);
+
+                if (ble_elm327_len > 0) {
+                    cJSON *rsp = cJSON_CreateObject();
+                    if (rsp) {
+                        cJSON_AddStringToObject(rsp, "response", ble_elm327_buf);
+                        char *json_out = cJSON_PrintUnformatted(rsp);
+                        cJSON_Delete(rsp);
+                        if (json_out) {
+                            cJSON_Delete(root);
+                            free(ble_elm327_buf);
+                            ble_elm327_buf = NULL;
+                            ble_send_response_fff1(json_out, strlen(json_out));
+                            free(json_out);
+                            return true;
+                        }
+                    }
+                    response = "{\"error\":\"alloc failed\"}";
+                } else {
+                    response = "{\"error\":\"no response\"}";
+                }
+                free(ble_elm327_buf);
+                ble_elm327_buf = NULL;
+            } else {
+                response = "{\"error\":\"alloc failed\"}";
+            }
+        } else {
+            response = "{\"error\":\"missing data field\"}";
         }
     }
 
