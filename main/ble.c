@@ -45,6 +45,7 @@
 #include "esp_log.h"
 #include "esp_gatt_common_api.h"
 #include "cJSON.h"
+#include "rtcm.h"
 #include "types.h"
 #include "ble.h"
 #include "comm_server.h"
@@ -1378,6 +1379,45 @@ static bool ble_handle_json_cmd(const uint8_t *data, uint16_t len)
     } else if (strcmp(cmd_str, "get_dest_stats") == 0) {
         response = autopid_get_destinations_stats_json();
         free_response = (response != NULL);
+    } else if (strcmp(cmd_str, "set_rtc_time") == 0) {
+        cJSON *hour = cJSON_GetObjectItem(root, "hour");
+        cJSON *min = cJSON_GetObjectItem(root, "min");
+        cJSON *sec = cJSON_GetObjectItem(root, "sec");
+        cJSON *year = cJSON_GetObjectItem(root, "year");
+        cJSON *month = cJSON_GetObjectItem(root, "month");
+        cJSON *day = cJSON_GetObjectItem(root, "day");
+        cJSON *weekday = cJSON_GetObjectItem(root, "weekday");
+
+        if (hour && min && sec && year && month && day && weekday &&
+            cJSON_IsNumber(hour) && cJSON_IsNumber(min) && cJSON_IsNumber(sec) &&
+            cJSON_IsNumber(year) && cJSON_IsNumber(month) && cJSON_IsNumber(day) &&
+            cJSON_IsNumber(weekday))
+        {
+            esp_err_t terr = rtcm_set_time((uint8_t)hour->valueint, (uint8_t)min->valueint, (uint8_t)sec->valueint);
+            esp_err_t derr = rtcm_set_date((uint8_t)year->valueint, (uint8_t)month->valueint,
+                                           (uint8_t)day->valueint, (uint8_t)weekday->valueint);
+            if (terr == ESP_OK && derr == ESP_OK) {
+                rtcm_sync_system_time_from_rtc();
+                response = "{\"rtc_set\":true}";
+            } else {
+                response = "{\"rtc_set\":false}";
+            }
+        } else {
+            response = "{\"error\":\"missing fields\"}";
+        }
+    } else if (strcmp(cmd_str, "get_rtc_time") == 0) {
+        uint8_t h, m, s, yr, mo, dy, wd;
+        esp_err_t terr = rtcm_get_time(&h, &m, &s);
+        esp_err_t derr = rtcm_get_date(&yr, &mo, &dy, &wd);
+        if (terr == ESP_OK && derr == ESP_OK) {
+            static char rtc_buf[96];
+            snprintf(rtc_buf, sizeof(rtc_buf),
+                     "{\"hour\":%u,\"min\":%u,\"sec\":%u,\"year\":%u,\"month\":%u,\"day\":%u,\"weekday\":%u}",
+                     h, m, s, yr, mo, dy, wd);
+            response = rtc_buf;
+        } else {
+            response = "{\"error\":\"rtc read failed\"}";
+        }
     }
 
     cJSON_Delete(root);

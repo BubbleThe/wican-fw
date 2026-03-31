@@ -69,6 +69,23 @@ Returns success/fail counts per configured destination (MQTT, webhook, etc.).
 {"destinations":[{"success":142,"fail":0},{"success":140,"fail":2}]}
 ```
 
+**Set RTC time**
+
+Sets the hardware RTC clock. Values are BCD-encoded, matching the WebSocket `set_rtc_time` command format. After setting, the ESP32 system clock is synced to the RTC.
+
+- Write: `{"cmd":"set_rtc_time","hour":32,"min":48,"sec":0,"year":38,"month":3,"day":49,"weekday":1}`
+- Response: `{"rtc_set":true}` or `{"rtc_set":false}` on I2C error
+- Missing or non-numeric fields: `{"error":"missing fields"}`
+
+BCD encoding: decimal 20 = BCD 0x20 = 32, decimal 30 = BCD 0x30 = 48. The year is offset from 2000 (year 38 = BCD 0x26 = 2026).
+
+**Get RTC time**
+
+Reads the current hardware RTC clock. Values are BCD-encoded.
+
+- Write: `{"cmd":"get_rtc_time"}`
+- Response: `{"hour":32,"min":48,"sec":0,"year":38,"month":3,"day":49,"weekday":1}`
+
 If no data is available, or the `cmd` value is not recognized, the response is `{"error":"no data"}`.
 
 Non-JSON writes (AT commands, slcan frames) are passed through to the CAN stack as before. Malformed JSON (missing `cmd` field, invalid syntax) is also passed through. The JSON command interface does not interfere with other protocol modes.
