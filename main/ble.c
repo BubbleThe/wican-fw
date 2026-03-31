@@ -44,6 +44,7 @@
 
 #include "esp_log.h"
 #include "esp_gatt_common_api.h"
+#include "cJSON.h"
 #include "types.h"
 #include "ble.h"
 #include "comm_server.h"
@@ -71,6 +72,7 @@
 #define BLE_SEND_BUF_SIZE                         490
 #define BLE_CMDLINE_MAX                           1024
 static void ble_cmdline_output(const char *data, size_t len);
+static bool ble_handle_json_cmd(const uint8_t *data, uint16_t len);
 
 #define BLE_CONNECTED_BIT 			BIT0
 #define BLE_CONGEST_BIT			BIT1
@@ -917,6 +919,11 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
                     cmdline_print_prompt_on_ble();
                 }
             } else {
+                // Intercept JSON commands on FFF1 before they reach the CAN TX queue
+                if (ble_handle_json_cmd(param->write.value, param->write.len)) {
+                    ESP_LOGI(GATTS_TABLE_TAG, "Handled JSON command via BLE");
+                    break;
+                }
                 ESP_LOGI(GATTS_TABLE_TAG, "Write to characteristic (handle: 0x%04x)", param->write.handle);
                 memcpy(rx_buffer.ucElement, param->write.value, param->write.len);
                 rx_buffer.dev_channel = DEV_BLE;
@@ -1302,6 +1309,90 @@ bool ble_tx_ready(void)
     }
     return false;
 }
+// Send a string response on FFF1 with MTU chunking and newline terminator
+static void ble_send_response_fff1(const char *data, size_t len)
+{
+    if (!is_connected || spp_gatts_if == ESP_GATT_IF_NONE) return;
+
+    size_t offset = 0;
+    while (offset < len) {
+        int tries = 0;
+        while (!ble_tx_ready() && tries++ < 100) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        if (tries >= 100) break;
+        size_t chunk = len - offset;
+        if (chunk > ble_max_data_size) chunk = ble_max_data_size;
+        esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id,
+            fff0_profile_handle_table[IDX_CHAR_FFF1_VAL], (uint16_t)chunk,
+            (uint8_t *)(data + offset), false);
+        offset += chunk;
+    }
+
+    // Send newline terminator so client knows the response is complete
+    int tries = 0;
+    while (!ble_tx_ready() && tries++ < 100) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (tries < 100) {
+        uint8_t nl = '\n';
+        esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id,
+            fff0_profile_handle_table[IDX_CHAR_FFF1_VAL], 1, &nl, false);
+    }
+}
+
+// Handle JSON commands received on FFF1. Returns true if handled.
+static bool ble_handle_json_cmd(const uint8_t *data, uint16_t len)
+{
+    if (len < 2 || data[0] != '{') return false;
+
+    // Null-terminate for cJSON (data may not be terminated)
+    char *buf = malloc(len + 1);
+    if (!buf) return false;
+    memcpy(buf, data, len);
+    buf[len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return false;
+
+    cJSON *cmd = cJSON_GetObjectItem(root, "cmd");
+    if (!cmd || !cJSON_IsString(cmd)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    const char *cmd_str = cmd->valuestring;
+    char *response = NULL;
+    bool free_response = false;
+
+    if (strcmp(cmd_str, "get_autopid_data") == 0) {
+        response = autopid_data_read();
+        free_response = (response != NULL);
+    } else if (strcmp(cmd_str, "get_ecu_status") == 0) {
+        bool online = autopid_get_ecu_status();
+        response = online ? "{\"ecu_online\":true}" : "{\"ecu_online\":false}";
+    } else if (strcmp(cmd_str, "get_config") == 0) {
+        response = autopid_get_config();
+        // Returns cached internal pointer — do not free
+    } else if (strcmp(cmd_str, "get_dest_stats") == 0) {
+        response = autopid_get_destinations_stats_json();
+        free_response = (response != NULL);
+    }
+
+    cJSON_Delete(root);
+
+    if (response) {
+        ble_send_response_fff1(response, strlen(response));
+        if (free_response) free(response);
+    } else {
+        static const char err[] = "{\"error\":\"no data\"}";
+        ble_send_response_fff1(err, sizeof(err) - 1);
+    }
+
+    return true;
+}
+
 void ble_send(uint8_t* buf, uint8_t buf_len)
 {
     if(ble_tx_ready())
