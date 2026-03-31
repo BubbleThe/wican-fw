@@ -88,15 +88,15 @@ Reads the current hardware RTC clock. Values are BCD-encoded.
 
 **ELM327 passthrough**
 
-Sends a raw ELM327/AT command and returns the response. AutoPID polling is paused automatically while the command executes and resumes after 10 seconds of inactivity. The command string must include the trailing `\r`.
+Sends a raw ELM327/AT command and returns the response. The command is executed between AutoPID polling cycles — AutoPID is not paused or disrupted. ELM327 settings are restored after each command so AutoPID resumes cleanly. The trailing `\r` is added automatically if omitted.
 
-- Write: `{"cmd":"elm327","data":"09 02\r"}`
+- Write: `{"cmd":"elm327","data":"09 02"}`
 - Response:
 ```json
 {"response":"49 02 01 31 48 47 ...\r\r>"}
 ```
 
-Timeout is 5 seconds. If the ELM327 does not respond: `{"error":"no response"}`.
+The device waits up to 6 seconds for AutoPID to yield ELM327 access and another 6 seconds for the ELM327 response. If AutoPID does not yield in time: `{"error":"autopid busy"}`. If the ELM327 does not respond: `{"error":"no response"}`.
 
 If no data is available, or the `cmd` value is not recognized, the response is `{"error":"no data"}`.
 

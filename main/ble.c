@@ -1343,23 +1343,54 @@ static void ble_send_response_fff1(const char *data, size_t len)
     }
 }
 
-// ELM327 response accumulator for BLE passthrough
-#define BLE_ELM327_BUF_SIZE 2048
+// ELM327 BLE passthrough — uses the same autopid_lock() + elm327_process_cmd()
+// pattern as the HTTP /autopid/test_pid endpoint. Autopid releases its mutex
+// between PID polls, so we grab it during that gap. No polling pause needed.
+#define BLE_ELM327_BUF_SIZE  2048
+#define BLE_ELM327_CMD_SIZE  128
+
 static char *ble_elm327_buf;
 static size_t ble_elm327_len;
+static SemaphoreHandle_t ble_elm327_done;
+static StaticSemaphore_t ble_elm327_done_buf;
+static char ble_elm327_cmd_buf[BLE_ELM327_CMD_SIZE];
+static uint32_t ble_elm327_cmd_len;
+static int64_t ble_elm327_last_cmd_time;
 
-static void ble_elm327_response_cb(char *str, uint32_t len, QueueHandle_t *q, char *cmd_str)
+static void ble_elm327_capture_cb(char *str, uint32_t len, QueueHandle_t *q, char *cmd_str)
 {
     (void)q;
     (void)cmd_str;
-    if (!ble_elm327_buf) return;
-    size_t to_copy = len;
-    if (ble_elm327_len + to_copy > BLE_ELM327_BUF_SIZE - 1)
-        to_copy = BLE_ELM327_BUF_SIZE - 1 - ble_elm327_len;
-    if (to_copy > 0) {
-        memcpy(ble_elm327_buf + ble_elm327_len, str, to_copy);
-        ble_elm327_len += to_copy;
-        ble_elm327_buf[ble_elm327_len] = '\0';
+    if (ble_elm327_buf) {
+        size_t avail = BLE_ELM327_BUF_SIZE - 1 - ble_elm327_len;
+        size_t to_copy = len < avail ? len : avail;
+        if (to_copy > 0) {
+            memcpy(ble_elm327_buf + ble_elm327_len, str, to_copy);
+            ble_elm327_len += to_copy;
+            ble_elm327_buf[ble_elm327_len] = '\0';
+        }
+    }
+    // Signal completion — uart1_event_task calls this after prompt received
+    if (ble_elm327_done)
+        xSemaphoreGive(ble_elm327_done);
+}
+
+// Restore ELM327 state after BLE command so autopid finds expected settings.
+// Mirrors autopid_test_pid_restore_autopid_safe_elm_state().
+static void ble_elm327_restore_state(void)
+{
+    static const char *restore_cmds[] = {
+        "ate0\r", "rath1\r", "ratl0\r", "rats1\r", "ratm0\r", "ratst96\r", NULL
+    };
+    for (int i = 0; restore_cmds[i]; i++) {
+        memset(ble_elm327_cmd_buf, 0, BLE_ELM327_CMD_SIZE);
+        ble_elm327_cmd_len = 0;
+        while (xSemaphoreTake(ble_elm327_done, 0) == pdTRUE)
+            ; // drain
+        elm327_process_cmd((uint8_t *)restore_cmds[i], strlen(restore_cmds[i]),
+                           NULL, ble_elm327_cmd_buf, &ble_elm327_cmd_len,
+                           &ble_elm327_last_cmd_time, ble_elm327_capture_cb);
+        xSemaphoreTake(ble_elm327_done, pdMS_TO_TICKS(1200));
     }
 }
 
@@ -1442,43 +1473,77 @@ static bool ble_handle_json_cmd(const uint8_t *data, uint16_t len)
     } else if (strcmp(cmd_str, "elm327") == 0) {
         cJSON *data_field = cJSON_GetObjectItem(root, "data");
         if (data_field && cJSON_IsString(data_field) && strlen(data_field->valuestring) > 0) {
-            // Pause autopid polling
-            dev_status_clear_bits(DEV_AUTOPID_ELM327_APP_BIT);
-            autopid_app_reset_timer();
+            // Create completion semaphore once
+            if (!ble_elm327_done)
+                ble_elm327_done = xSemaphoreCreateBinaryStatic(&ble_elm327_done_buf);
 
-            // Allocate response buffer
-            ble_elm327_buf = heap_caps_malloc(BLE_ELM327_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            ble_elm327_len = 0;
+            // Wait for autopid to release its mutex (up to 6s)
+            if (!autopid_lock(6000)) {
+                response = "{\"error\":\"autopid busy\"}";
+            } else {
+                ble_elm327_buf = heap_caps_malloc(BLE_ELM327_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                ble_elm327_len = 0;
 
-            if (ble_elm327_buf) {
-                ble_elm327_buf[0] = '\0';
-                // Block until ELM327 responds or 5s timeout
-                elm327_run_command(data_field->valuestring, strlen(data_field->valuestring),
-                                   5000, NULL, ble_elm327_response_cb, false, 0);
+                if (ble_elm327_buf) {
+                    ble_elm327_buf[0] = '\0';
 
-                if (ble_elm327_len > 0) {
-                    cJSON *rsp = cJSON_CreateObject();
-                    if (rsp) {
-                        cJSON_AddStringToObject(rsp, "response", ble_elm327_buf);
-                        char *json_out = cJSON_PrintUnformatted(rsp);
-                        cJSON_Delete(rsp);
-                        if (json_out) {
-                            cJSON_Delete(root);
-                            free(ble_elm327_buf);
-                            ble_elm327_buf = NULL;
-                            ble_send_response_fff1(json_out, strlen(json_out));
-                            free(json_out);
-                            return true;
+                    // Ensure command has trailing \r
+                    const char *send = data_field->valuestring;
+                    char local_cmd[128];
+                    size_t slen = strlen(send);
+                    if (slen > 0 && send[slen - 1] != '\r') {
+                        if (slen + 1 < sizeof(local_cmd)) {
+                            memcpy(local_cmd, send, slen);
+                            local_cmd[slen] = '\r';
+                            local_cmd[slen + 1] = '\0';
+                            send = local_cmd;
+                            slen++;
                         }
                     }
-                    response = "{\"error\":\"alloc failed\"}";
+
+                    // Drain previous signals, reset cmd buffer
+                    while (xSemaphoreTake(ble_elm327_done, 0) == pdTRUE)
+                        ;
+                    memset(ble_elm327_cmd_buf, 0, BLE_ELM327_CMD_SIZE);
+                    ble_elm327_cmd_len = 0;
+
+                    // Enqueue to elm327_cmd_queue — uart1_event_task handles TX/RX
+                    bool cmd_sent = (elm327_process_cmd((uint8_t *)send, (uint32_t)slen,
+                                           NULL, ble_elm327_cmd_buf, &ble_elm327_cmd_len,
+                                           &ble_elm327_last_cmd_time, ble_elm327_capture_cb) == 0);
+                    if (cmd_sent) {
+                        // Wait for response (up to 6s for multi-frame like VIN)
+                        xSemaphoreTake(ble_elm327_done, pdMS_TO_TICKS(6000));
+                        // Restore ELM settings so autopid finds expected state
+                        ble_elm327_restore_state();
+                    }
+                    autopid_unlock();
+
+                    if (ble_elm327_len > 0) {
+                        cJSON *rsp = cJSON_CreateObject();
+                        if (rsp) {
+                            cJSON_AddStringToObject(rsp, "response", ble_elm327_buf);
+                            char *json_out = cJSON_PrintUnformatted(rsp);
+                            cJSON_Delete(rsp);
+                            if (json_out) {
+                                cJSON_Delete(root);
+                                free(ble_elm327_buf);
+                                ble_elm327_buf = NULL;
+                                ble_send_response_fff1(json_out, strlen(json_out));
+                                free(json_out);
+                                return true;
+                            }
+                        }
+                        response = "{\"error\":\"alloc failed\"}";
+                    } else {
+                        response = "{\"error\":\"no response\"}";
+                    }
+                    free(ble_elm327_buf);
+                    ble_elm327_buf = NULL;
                 } else {
-                    response = "{\"error\":\"no response\"}";
+                    autopid_unlock();
+                    response = "{\"error\":\"alloc failed\"}";
                 }
-                free(ble_elm327_buf);
-                ble_elm327_buf = NULL;
-            } else {
-                response = "{\"error\":\"alloc failed\"}";
             }
         } else {
             response = "{\"error\":\"missing data field\"}";
